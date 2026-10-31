@@ -1,0 +1,6 @@
+aiogram>=3.0.0
+kurigram[qrcode]==2.2.26
+Pillow>=9.0
+TgCrypto
+aiosqlite>=0.19.0
+python-dotenv>=1.0.0
