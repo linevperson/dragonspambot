@@ -54,6 +54,24 @@ class GroupScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.db.reserve_group_attempt(self.campaign, group_id, 1604))
         self.assertTrue(await self.db.reserve_group_attempt(self.campaign, group_id, 1605))
 
+    async def test_manual_restart_resets_schedule_and_uses_new_interval(self):
+        group_id = (await self.db.get_campaign_groups(self.campaign))[0]["id"]
+        self.assertTrue(await self.db.reserve_group_attempt(self.campaign, group_id, 1000))
+        await self.db.finish_group_attempt(self.campaign, group_id, 1000)
+        await self.db.set_campaign_running(self.campaign, False)
+        await self.db.update_campaign_delay(self.campaign, 1800, 1800)
+        self.assertTrue(await self.db.start_campaign_fresh(self.campaign))
+        self.assertTrue(await self.db.reserve_group_attempt(self.campaign, group_id, 1001))
+        await self.db.finish_group_attempt(self.campaign, group_id, 1001)
+        self.assertFalse(await self.db.reserve_group_attempt(self.campaign, group_id, 2800))
+        self.assertTrue(await self.db.reserve_group_attempt(self.campaign, group_id, 2801))
+
+    async def test_starting_running_campaign_does_not_reset_schedule(self):
+        group_id = (await self.db.get_campaign_groups(self.campaign))[0]["id"]
+        self.assertTrue(await self.db.reserve_group_attempt(self.campaign, group_id, 1000))
+        self.assertFalse(await self.db.start_campaign_fresh(self.campaign))
+        self.assertFalse(await self.db.reserve_group_attempt(self.campaign, group_id, 1001))
+
     async def test_first_pass_sends_to_both_groups_without_30_minute_gap(self):
         client = SimpleNamespace(send_message=AsyncMock())
         lock = asyncio.Lock()

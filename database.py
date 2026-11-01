@@ -365,6 +365,24 @@ class Database:
             )
             await db.commit()
             logger.info(f"Campaign {campaign_id} running state: {is_running}")
+
+    async def start_campaign_fresh(self, campaign_id: int) -> bool:
+        """Start a stopped campaign with all groups due, in one transaction."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "UPDATE campaigns SET is_running = 1 WHERE id = ? AND is_running = 0",
+                (campaign_id,),
+            )
+            if not cursor.rowcount:
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE groups SET last_attempt_at = NULL, next_attempt_at = 0 WHERE campaign_id = ?",
+                (campaign_id,),
+            )
+            await db.commit()
+            return True
     
     async def get_running_campaigns(self) -> List[Dict[str, Any]]:
         """Get all currently running campaigns."""

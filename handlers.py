@@ -1033,7 +1033,9 @@ async def start_campaign(callback: CallbackQuery, user_id: int, owner_id: int):
         if current['is_running']:
             await callback.answer("⚠️ Кампания уже запущена!", show_alert=True)
             return
-        await db.set_campaign_running(campaign_id, True)
+        if not await db.start_campaign_fresh(campaign_id):
+            await callback.answer("⚠️ Кампания уже запущена или недоступна!", show_alert=True)
+            return
     
     await callback.answer("▶️ Кампания запущена!", show_alert=True)
     await callback.message.edit_text(
