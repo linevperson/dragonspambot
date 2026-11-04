@@ -114,8 +114,11 @@ async def main():
                         "groups_menu", "add_groups", "choose_groups", "show_groups", "clear_groups",
                         "config_delay", "delay_seconds", "delay_minutes",
                         "start_campaign", "stop_campaign",
+                        "post_card", "post_noop", "post_edit", "post_delete", "post_confirm", "post_back",
+                        "group_view", "group_enable", "group_disable", "group_delete", "group_confirm",
                     }
                     action, separator, campaign_id = callback_data.partition(":")
+                    campaign_id = campaign_id.split(":", 1)[0]
                     if (action == "create_campaign" or action in campaign_actions) and not await accounts.is_connected(user.id):
                         await event.callback_query.answer(
                             "Сначала подключите свой Telegram-аккаунт", show_alert=True

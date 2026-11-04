@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import secrets
+import time
 from html import escape
 from io import BytesIO
 from typing import Optional
@@ -17,7 +18,11 @@ import qrcode
 from database import db
 from accounts import accounts
 from spammer import flood_wait_remaining
-from pyrogram.errors import SessionPasswordNeeded
+from spammer import normalize_group_destination
+from post_content import serialize_entities, bot_entities
+from campaign_status import format_campaign_status, format_attempt_time
+from spammer import campaign_sending
+from pyrogram.errors import SessionPasswordNeeded, FloodWait
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,7 @@ def get_campaign_menu(campaign_id: int) -> InlineKeyboardMarkup:
             callback_data=f"delete_campaign:{campaign_id}"
         )
     )
+    builder.row(InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"campaign:{campaign_id}"))
     builder.row(
         InlineKeyboardButton(text="« Назад", callback_data="back_to_campaigns")
     )
@@ -518,34 +524,32 @@ async def create_campaign_save(message: Message, state: FSMContext, user_id: int
 
 
 @router.callback_query(F.data.startswith("campaign:"))
-async def show_campaign(callback: CallbackQuery):
+async def show_campaign(callback: CallbackQuery, state: FSMContext):
     """Show campaign details and menu."""
     campaign_id = int(callback.data.split(":")[1])
-    campaign = await db.get_campaign(campaign_id)
+    await state.clear()
+    campaign = await db.get_campaign_status(campaign_id)
     
     if not campaign:
         await callback.answer("❌ Кампания не найдена!", show_alert=True)
         return
     
-    messages = await db.get_campaign_messages(campaign_id)
-    groups = await db.get_campaign_groups(campaign_id)
-    
-    status = "🟢 Запущена" if campaign['is_running'] else "⚪️ Остановлена"
+    status = format_campaign_status(campaign, campaign_id in campaign_sending, safety_blocked=campaign["owner_id"] in accounts.failed_flood_writes)
     
     text = (
-        f"📊 <b>{campaign['name']}</b>\n\n"
-        f"Статус: {status}\n"
-        f"📝 Вариантов постов: {len(messages)}\n"
-        f"👥 Групп: {len(groups)}\n"
+        f"📊 <b>{escape(campaign['name'])}</b>\n\n"
+        f"{status}\n\n"
+        f"📝 Вариантов постов: {campaign['message_count']}\n"
+        f"👥 Групп: {campaign['group_count']} (включено: {campaign['enabled_group_count']})\n"
         f"⏱ Интервал для каждой группы: {format_delay_range(campaign['min_delay'], campaign['max_delay'])}\n\n"
         f"Выберите действие:"
     )
     
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_campaign_menu(campaign_id),
-        parse_mode="HTML"
-    )
+    try:
+        await callback.message.edit_text(text, reply_markup=get_campaign_menu(campaign_id), parse_mode="HTML")
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
     await callback.answer()
 
 
@@ -586,6 +590,7 @@ async def add_message_start(callback: CallbackQuery, state: FSMContext):
     """Start adding a message variant."""
     campaign_id = int(callback.data.split(":")[1])
     
+    await state.clear()
     await state.update_data(campaign_id=campaign_id)
     await callback.message.edit_text(
         "📝 <b>Добавление варианта поста</b>\n\n"
@@ -593,7 +598,8 @@ async def add_message_start(callback: CallbackQuery, state: FSMContext):
         "Можно отправить:\n"
         "• Только текст\n"
         "• Текст + фото\n"
-        "• Текст + видео",
+        "• Текст + видео\n"
+        "• Кружок (видеосообщение)",
         reply_markup=get_back_to_campaign_button(campaign_id),
         parse_mode="HTML"
     )
@@ -616,6 +622,7 @@ async def add_message_save(message: Message, state: FSMContext):
     text = message.caption if message.caption else message.text
     media_type = None
     media_id = None
+    metadata = {}
     
     if message.photo:
         media_type = "photo"
@@ -623,52 +630,139 @@ async def add_message_save(message: Message, state: FSMContext):
     elif message.video:
         media_type = "video"
         media_id = message.video.file_id
+    elif message.video_note:
+        media_type = "video_note"
+        media_id = message.video_note.file_id
+        metadata = {"duration": message.video_note.duration, "length": message.video_note.length}
     elif message.text:
         media_type = "text"
     else:
         await message.answer(
             "❌ Неподдерживаемый тип сообщения.\n"
-            "Отправьте текст, фото с текстом или видео с текстом.",
+            "Отправьте текст, фото, видео или кружок.",
             reply_markup=get_back_to_campaign_button(campaign_id)
         )
         return
     
-    message_id = await db.add_message(campaign_id, text, media_type, media_id)
+    entities = serialize_entities(message.caption_entities if message.caption is not None else message.entities)
+    if data.get("editing_message_id"):
+        message_id = data["editing_message_id"]
+        changed = await db.replace_message(campaign_id, message_id, text, media_type, media_id, entities, metadata)
+        if not changed:
+            await state.clear()
+            await message.answer("Пост уже удалён. Добавьте его заново.", reply_markup=get_campaign_menu(campaign_id))
+            return
+    else:
+        message_id = await db.add_message(campaign_id, text, media_type, media_id, entities, metadata)
     await state.clear()
     
     await message.answer(
-        f"✅ Вариант поста добавлен! (ID: {message_id})",
+        f"✅ Вариант поста {'изменён' if data.get('editing_message_id') else 'добавлен'}! (ID: {message_id})",
         reply_markup=get_campaign_menu(campaign_id)
     )
 
 
 @router.callback_query(F.data.startswith("list_messages:"))
-async def list_messages(callback: CallbackQuery):
-    """Show all message variants for a campaign."""
+async def list_messages(callback: CallbackQuery, state: FSMContext):
+    """Open the post browser."""
     campaign_id = int(callback.data.split(":")[1])
-    messages = await db.get_campaign_messages(campaign_id)
-    
-    if not messages:
-        await callback.answer("📝 Нет добавленных вариантов постов", show_alert=True)
+    await remove_post_preview(callback, state)
+    await state.clear()
+    await show_post_card(callback, state, campaign_id, 0)
+
+
+async def remove_post_preview(callback, state):
+    data = await state.get_data()
+    if data.get("post_preview_id"):
+        try:
+            await callback.bot.delete_message(callback.message.chat.id, data["post_preview_id"])
+        except TelegramBadRequest:
+            pass
+        await state.update_data(post_preview_id=None)
+
+
+async def show_post_card(callback, state, campaign_id, index):
+    if not await db.campaign_belongs_to(campaign_id, callback.from_user.id):
+        await callback.answer("Кампания недоступна", show_alert=True)
         return
-    
-    text = f"📝 <b>Варианты постов ({len(messages)})</b>\n\n"
-    for idx, msg in enumerate(messages, 1):
-        msg_type = {
-            'text': '📄 Текст',
-            'photo': '🖼 Фото',
-            'video': '🎥 Видео'
-        }.get(msg['media_type'], '❓')
-        
-        preview = msg['text'][:50] + "..." if msg['text'] and len(msg['text']) > 50 else msg['text']
-        text += f"{idx}. {msg_type} (ID: {msg['id']})\n{preview}\n\n"
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_campaign_menu(campaign_id),
-        parse_mode="HTML"
+    await remove_post_preview(callback, state)
+    messages = await db.get_campaign_messages(campaign_id)
+    if not messages:
+        await callback.message.answer("📝 В кампании нет постов.", reply_markup=get_campaign_menu(campaign_id))
+        await state.clear()
+        await callback.answer()
+        return
+    index = index % len(messages)
+    post = messages[index]
+    kind = post["media_type"]
+    entities = bot_entities(post.get("entities_json"))
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⬅️", callback_data=f"post_card:{campaign_id}:{(index - 1) % len(messages)}"),
+        InlineKeyboardButton(text=f"{index + 1} / {len(messages)}", callback_data=f"post_noop:{campaign_id}"),
+        InlineKeyboardButton(text="➡️", callback_data=f"post_card:{campaign_id}:{(index + 1) % len(messages)}"),
     )
+    builder.row(InlineKeyboardButton(text="✏️ Изменить пост", callback_data=f"post_edit:{campaign_id}:{post['id']}"))
+    builder.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"post_delete:{campaign_id}:{post['id']}:{index}"))
+    builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"post_back:{campaign_id}"))
+    keyboard = builder.as_markup()
+    try:
+        if kind == "photo":
+            preview = await callback.message.answer_photo(post["media_id"], caption=post["text"], caption_entities=entities, parse_mode=None, reply_markup=keyboard)
+        elif kind == "video":
+            preview = await callback.message.answer_video(post["media_id"], caption=post["text"], caption_entities=entities, parse_mode=None, reply_markup=keyboard)
+        elif kind == "video_note":
+            preview = await callback.message.answer_video_note(post["media_id"], reply_markup=keyboard)
+        else:
+            preview = await callback.message.answer(post["text"], entities=entities, parse_mode=None, reply_markup=keyboard)
+    except TelegramBadRequest:
+        preview = await callback.message.answer(
+            f"Пост {index + 1} из {len(messages)}. Telegram не разрешил предпросмотр с исходной разметкой или медиа.\n"
+            f"{(post['text'] or '')[:3000]}\n\nПост сохранён; его можно заменить.",
+            reply_markup=keyboard, parse_mode=None,
+        )
+    await state.update_data(post_preview_id=preview.message_id)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("post_"))
+async def post_card_action(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    action, campaign_id = parts[0], int(parts[1])
+    if not await db.campaign_belongs_to(campaign_id, callback.from_user.id):
+        await callback.answer("Кампания недоступна", show_alert=True)
+        return
+    if action == "post_noop":
+        await callback.answer()
+    elif action == "post_card":
+        await show_post_card(callback, state, campaign_id, int(parts[2]))
+    elif action == "post_back":
+        await remove_post_preview(callback, state)
+        await state.clear()
+        await callback.message.answer("Управление кампанией", reply_markup=get_campaign_menu(campaign_id))
+        await callback.answer()
+    elif action in ("post_edit", "post_delete", "post_confirm"):
+        post = await db.get_message(int(parts[2]))
+        if not post or post["campaign_id"] != campaign_id:
+            await callback.answer("Пост уже удалён или недоступен", show_alert=True)
+            return
+        if action == "post_edit":
+            await remove_post_preview(callback, state)
+            await state.clear()
+            await state.update_data(campaign_id=campaign_id, editing_message_id=post["id"])
+            await state.set_state(MessageConfig.waiting_for_message)
+            await callback.message.answer("Отправьте новый текст, фото, видео или кружок для замены этого поста.", reply_markup=get_back_to_campaign_button(campaign_id))
+            await callback.answer()
+        elif action == "post_delete":
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Да, удалить", callback_data=f"post_confirm:{campaign_id}:{post['id']}:{parts[3]}")],
+                [InlineKeyboardButton(text="Отмена", callback_data=f"post_card:{campaign_id}:{parts[3]}")],
+            ])
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+            await callback.answer()
+        else:
+            await db.delete_campaign_message(campaign_id, post["id"])
+            await show_post_card(callback, state, campaign_id, int(parts[3]))
 
 
 # ===== GROUPS MANAGEMENT =====
@@ -744,7 +838,7 @@ async def choose_groups_save(message: Message, state: FSMContext, user_id: int, 
             if any(item["group_link"].strip().lower() in aliases for item in existing):
                 added = 0
             else:
-                added = await db.add_group_for_owner(campaign_id, user_id, str(shared.chat_id))
+                added = await db.add_group_for_owner(campaign_id, user_id, str(shared.chat_id), getattr(found, "title", None))
                 if added is None:
                     await state.clear()
                     await message.answer("Кампания недоступна.", reply_markup=ReplyKeyboardRemove())
@@ -849,27 +943,155 @@ async def add_groups_save(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("show_groups:"))
-async def show_groups(callback: CallbackQuery):
+async def show_groups(callback: CallbackQuery, user_id: int):
     """Display all groups for a campaign."""
     campaign_id = int(callback.data.split(":")[1])
     groups = await db.get_campaign_groups(campaign_id)
+    if not await db.campaign_belongs_to(campaign_id, user_id):
+        await callback.answer("Кампания недоступна", show_alert=True)
+        return
     
     if not groups:
         await callback.answer("📋 Список групп пуст", show_alert=True)
         return
     
+    parts = callback.data.split(":")
+    pages = (len(groups) + 14) // 15
+    page = min(max(int(parts[2]) if len(parts) > 2 else 0, 0), pages - 1)
+    visible = groups[page * 15:(page + 1) * 15]
+    await callback.answer()
+
+    async def resolve_titles():
+        async with accounts.lock(user_id):
+            if await flood_wait_remaining(user_id):
+                return
+            client = await accounts.get_client(user_id)
+            if not client:
+                return
+            missing_ids = {int(g["group_link"]) for g in visible if not g.get("group_title") and g["group_link"].lstrip("-").isdigit()}
+            if missing_ids:
+                for archived in (False, True):
+                    async for dialog in client.get_dialogs(from_archive=archived):
+                        if dialog.chat.id in missing_ids:
+                            for group in visible:
+                                if group["group_link"] == str(dialog.chat.id):
+                                    group["group_title"] = dialog.chat.title
+                                    await db.cache_group_title(campaign_id, group["id"], dialog.chat.title)
+                            missing_ids.discard(dialog.chat.id)
+                        if not missing_ids:
+                            break
+                    if not missing_ids:
+                        break
+            for group in visible:
+                if group.get("group_title"):
+                    continue
+                try:
+                    chat = await client.get_chat(normalize_group_destination(group["group_link"]))
+                    group["group_title"] = chat.title
+                    await db.cache_group_title(campaign_id, group["id"], chat.title)
+                except FloodWait:
+                    raise
+                except Exception:
+                    continue
+
+    try:
+        await asyncio.wait_for(resolve_titles(), timeout=10)
+    except FloodWait as exc:
+        await db.stop_account_for_flood(user_id, exc.value)
+    except Exception as exc:
+        logger.warning("Group title lookup incomplete: %s", type(exc).__name__)
     text = "📋 <b>Список групп:</b>\n\n"
-    for group in groups:
-        text += f"• <code>{group['group_link']}</code>\n"
+    for group in visible:
+        title = group.get("group_title") or group["group_link"]
+        text += f"{'🟢' if group['is_enabled'] else '⏸'} {escape(title[:180])}\n"
     
     text += f"\n<b>Всего:</b> {len(groups)}"
     
+    keyboard = get_groups_menu(campaign_id)
+    keyboard.inline_keyboard[0:0] = [[InlineKeyboardButton(
+        text=f"{'🟢' if group['is_enabled'] else '⏸'} {(group.get('group_title') or group['group_link'])[:60]}",
+        callback_data=f"group_view:{campaign_id}:{group['id']}",
+    )] for group in visible]
+    if pages > 1:
+        keyboard.inline_keyboard.insert(0, [
+            InlineKeyboardButton(text="⬅️", callback_data=f"show_groups:{campaign_id}:{(page - 1) % pages}"),
+            InlineKeyboardButton(text=f"{page + 1} / {pages} ➡️", callback_data=f"show_groups:{campaign_id}:{(page + 1) % pages}"),
+        ])
     await callback.message.edit_text(
         text,
-        reply_markup=get_groups_menu(campaign_id),
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
+
+
+async def show_group_details(callback, campaign_id, group_id):
+    group = await db.get_group(campaign_id, group_id)
+    if not group:
+        await callback.answer("Группа уже удалена", show_alert=True)
+        return
+    campaign = await db.get_campaign(campaign_id)
+    title = escape(group.get("group_title") or group["group_link"])
+    enabled = bool(group["is_enabled"])
+    next_time = "—"
+    if enabled and campaign["is_running"]:
+        next_time = format_attempt_time(group["next_attempt_at"]) if group["next_attempt_at"] > time.time() else "сейчас / в очереди"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏸ Выключить группу" if enabled else "▶️ Включить группу",
+                              callback_data=f"group_{'disable' if enabled else 'enable'}:{campaign_id}:{group_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить группу", callback_data=f"group_delete:{campaign_id}:{group_id}")],
+        [InlineKeyboardButton(text="« К списку групп", callback_data=f"show_groups:{campaign_id}")],
+    ])
+    text = (
+        f"👥 <b>{title}</b>\n\n"
+        f"Статус: {'🟢 Включена' if enabled else '⏸ Выключена'}\n"
+        f"Последняя попытка: {format_attempt_time(group['last_attempt_at'])}\n"
+        f"Ближайшая попытка: {next_time}\n"
+        "Время: Киев.\n\n"
+        "Выключенная группа остаётся в кампании, но не участвует в рассылке. "
+        "При включении сохраняется прежнее расписание. Уже начатый Telegram-запрос отменить нельзя."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("group_"))
+async def group_action(callback: CallbackQuery, user_id: int):
+    action, campaign_text, group_text = callback.data.split(":")
+    campaign_id, group_id = int(campaign_text), int(group_text)
+    if not await db.campaign_belongs_to(campaign_id, user_id):
+        await callback.answer("Кампания недоступна", show_alert=True)
+        return
+    group = await db.get_group(campaign_id, group_id)
+    if not group:
+        await callback.answer("Группа уже удалена или недоступна", show_alert=True)
+        return
+    if action in ("group_enable", "group_disable"):
+        if not await db.set_group_enabled(campaign_id, group_id, user_id, action == "group_enable"):
+            await callback.answer("Группа недоступна", show_alert=True)
+            return
+        await show_group_details(callback, campaign_id, group_id)
+    elif action == "group_view":
+        await show_group_details(callback, campaign_id, group_id)
+    elif action == "group_delete":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Да, удалить", callback_data=f"group_confirm:{campaign_id}:{group_id}")],
+            [InlineKeyboardButton(text="Отмена", callback_data=f"group_view:{campaign_id}:{group_id}")],
+        ])
+        title = escape(group.get("group_title") or group["group_link"])
+        await callback.message.edit_text(f"Удалить группу <b>{title}</b> из кампании?", reply_markup=keyboard, parse_mode="HTML")
+        await callback.answer()
+    elif action == "group_confirm":
+        await db.delete_group_for_owner(campaign_id, group_id, user_id)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« К списку групп", callback_data=f"show_groups:{campaign_id}")],
+            [InlineKeyboardButton(text="« К кампании", callback_data=f"campaign:{campaign_id}")],
+        ])
+        await callback.message.edit_text("✅ Группа удалена из кампании. Остальные группы сохранены.", reply_markup=keyboard)
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("clear_groups:"))
@@ -1009,6 +1231,9 @@ async def start_campaign(callback: CallbackQuery, user_id: int, owner_id: int):
     if not groups:
         await callback.answer("❌ Список групп пуст!", show_alert=True)
         return
+    if not any(group["is_enabled"] for group in groups):
+        await callback.answer("⏸ Все группы выключены. Сначала включите хотя бы одну.", show_alert=True)
+        return
     
     async with accounts.lock(user_id):
         if user_id != owner_id and not await db.is_authorized_user(user_id):
@@ -1037,10 +1262,12 @@ async def start_campaign(callback: CallbackQuery, user_id: int, owner_id: int):
             await callback.answer("⚠️ Кампания уже запущена или недоступна!", show_alert=True)
             return
     
+    snapshot = await db.get_campaign_status(campaign_id)
+    status = format_campaign_status(snapshot, campaign_id in campaign_sending)
     await callback.answer("▶️ Кампания запущена!", show_alert=True)
     await callback.message.edit_text(
-        f"🚀 <b>{campaign['name']}</b>\n\n"
-        f"✅ Рассылка запущена!\n\n"
+        f"🚀 <b>{escape(campaign['name'])}</b>\n\n"
+        f"{status}\n\n"
         f"📝 Вариантов постов: {len(messages)}\n"
         f"👥 Групп: {len(groups)}\n"
         f"⏱ Интервал для каждой группы: {format_delay_range(campaign['min_delay'], campaign['max_delay'])}\n\n"
@@ -1066,11 +1293,12 @@ async def stop_campaign(callback: CallbackQuery):
         return
     
     await db.set_campaign_running(campaign_id, False)
-    
+    snapshot = await db.get_campaign_status(campaign_id)
+    status = format_campaign_status(snapshot)
     await callback.answer("⏹ Кампания остановлена!", show_alert=True)
     await callback.message.edit_text(
-        f"⏹ <b>{campaign['name']}</b>\n\n"
-        "Рассылка остановлена.\n\n"
+        f"⏹ <b>{escape(campaign['name'])}</b>\n\n"
+        f"{status}\n\n"
         "Вы можете запустить её снова когда будет нужно.",
         reply_markup=get_campaign_menu(campaign_id),
         parse_mode="HTML"

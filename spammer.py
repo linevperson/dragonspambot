@@ -2,21 +2,24 @@ import asyncio
 import logging
 import random
 import time
+import json
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict
 
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.errors import FloodWait, ChatWriteForbidden, UserBannedInChannel, ChannelPrivate, ChatAdminRequired, SlowmodeWait
 from pyrogram.errors.exceptions.bad_request_400 import PeerIdInvalid, UsernameInvalid
 
 from database import db
 from accounts import accounts
+from post_content import sender_entities
 
 logger = logging.getLogger(__name__)
 
 # Dictionary to track running campaign tasks
 campaign_tasks: Dict[int, asyncio.Task] = {}
+campaign_sending: Dict[int, int] = {}
 
 
 async def flood_wait_remaining(user_id):
@@ -41,7 +44,7 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
             logger.info("⏹ [Campaign %s] Stopped", campaign_id)
             return
         messages = await db.get_campaign_messages(campaign_id)
-        groups = await db.get_campaign_groups(campaign_id)
+        groups = [group for group in await db.get_campaign_groups(campaign_id) if group["is_enabled"]]
         if not messages or not groups:
             await asyncio.sleep(5)
             continue
@@ -69,27 +72,34 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
                     try:
                         client = await accounts.get_client(campaign["owner_id"])
                     except Exception as exc:
-                        await db.set_campaign_running(campaign_id, False)
+                        await db.set_campaign_running(campaign_id, False, reason="account")
                         logger.warning("[Campaign %s] Could not connect account: %s", campaign_id, type(exc).__name__)
                         return
                     if not client:
-                        await db.set_campaign_running(campaign_id, False)
+                        await db.set_campaign_running(campaign_id, False, reason="account")
                         return
+
+                    # A post may have been edited/deleted while this task waited.
+                    message = await db.get_message(message["id"])
+                    if not message or message["campaign_id"] != campaign_id:
+                        continue
 
                     reserved = await db.reserve_group_attempt(campaign_id, group["id"], time.time())
                     if not reserved:
                         continue
                     message_index += 1
+                    campaign_sending[campaign_id] = group["id"]
                     try:
                         if isinstance(destination, int) and destination < 0:
                             await ensure_group_peer(client, destination)
 
                         async def still_running():
                             current = await db.get_campaign(campaign_id)
-                            return bool(current and current["is_running"])
+                            target = await db.get_group(campaign_id, group["id"])
+                            return bool(current and current["is_running"] and target and target["is_enabled"])
 
                         if not await send_campaign_message(client, message, destination, admin_bot, still_running):
-                            return
+                            continue
                         logger.info("✅ [Campaign %s] Sent msg#%s → %s", campaign_id, message["id"], destination)
                     except FloodWait as exc:
                         try:
@@ -100,6 +110,7 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
                         logger.warning("Telegram FloodWait %ss: account campaigns stopped", exc.value)
                         return
                     finally:
+                        campaign_sending.pop(campaign_id, None)
                         await db.finish_group_attempt(campaign_id, group["id"], time.time())
             except SlowmodeWait:
                 logger.warning("⏳ [Campaign %s] SlowMode in %s", campaign_id, group_link)
@@ -128,7 +139,8 @@ async def ensure_group_peer(client, chat_id):
 
 
 async def send_campaign_message(client, message, chat_id, admin_bot=None, still_running=None):
-    if message['media_type'] in ('photo', 'video'):
+    entities = sender_entities(message.get("entities_json"))
+    if message['media_type'] in ('photo', 'video', 'video_note'):
         if not admin_bot:
             raise RuntimeError("Admin bot required to download media")
         media = BytesIO()
@@ -138,13 +150,16 @@ async def send_campaign_message(client, message, chat_id, admin_bot=None, still_
         if still_running and not await still_running():
             return False
         if message['media_type'] == 'photo':
-            await client.send_photo(chat_id=chat_id, photo=media, caption=message['text'])
+            await client.send_photo(chat_id=chat_id, photo=media, caption=message['text'], caption_entities=entities, parse_mode=enums.ParseMode.DISABLED)
+        elif message['media_type'] == 'video':
+            await client.send_video(chat_id=chat_id, video=media, caption=message['text'], caption_entities=entities, parse_mode=enums.ParseMode.DISABLED)
         else:
-            await client.send_video(chat_id=chat_id, video=media, caption=message['text'])
+            metadata = json.loads(message.get("media_metadata") or "{}")
+            await client.send_video_note(chat_id=chat_id, video_note=media, duration=metadata.get("duration", 0), length=metadata.get("length", 384))
     else:
         if still_running and not await still_running():
             return False
-        await client.send_message(chat_id=chat_id, text=message['text'])
+        await client.send_message(chat_id=chat_id, text=message['text'], entities=entities, parse_mode=enums.ParseMode.DISABLED)
     return True
 
 

@@ -2,6 +2,7 @@ import aiosqlite
 import logging
 import random
 import time
+import json
 from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,10 @@ class Database:
             columns = {row[1] for row in await cursor.fetchall()}
             if "owner_id" not in columns:
                 await db.execute("ALTER TABLE campaigns ADD COLUMN owner_id INTEGER")
+            if "stop_reason" not in columns:
+                await db.execute("ALTER TABLE campaigns ADD COLUMN stop_reason TEXT")
+            if "last_attempt_at" not in columns:
+                await db.execute("ALTER TABLE campaigns ADD COLUMN last_attempt_at REAL")
             
             # Messages table (multiple variants per campaign)
             await db.execute("""
@@ -54,6 +59,12 @@ class Database:
                 )
             """)
             
+            cursor = await db.execute("PRAGMA table_info(messages)")
+            message_columns = {row[1] for row in await cursor.fetchall()}
+            for column in ("entities_json", "media_metadata"):
+                if column not in message_columns:
+                    await db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+
             # Groups table (linked to campaigns)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS groups (
@@ -90,6 +101,10 @@ class Database:
 
             cursor = await db.execute("PRAGMA table_info(groups)")
             group_columns = {row[1] for row in await cursor.fetchall()}
+            if "group_title" not in group_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN group_title TEXT")
+            if "is_enabled" not in group_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
             if "last_attempt_at" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN last_attempt_at REAL")
             if "next_attempt_at" not in group_columns:
@@ -98,7 +113,8 @@ class Database:
             await db.execute(
                 "UPDATE campaigns SET owner_id = ? WHERE owner_id IS NULL", (owner_id,)
             )
-            await db.execute("UPDATE campaigns SET is_running = 0 WHERE is_running != 0")
+            await db.execute("UPDATE campaigns SET last_attempt_at = (SELECT MAX(g.last_attempt_at) FROM groups g WHERE g.campaign_id = campaigns.id) WHERE last_attempt_at IS NULL")
+            await db.execute("UPDATE campaigns SET is_running = 0, stop_reason = 'restart' WHERE is_running != 0")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_campaigns_owner ON campaigns(owner_id)"
             )
@@ -134,14 +150,14 @@ class Database:
             cursor = await conn.execute(
                 "DELETE FROM authorized_users WHERE user_id = ?", (user_id,)
             )
-            await conn.execute("UPDATE campaigns SET is_running = 0 WHERE owner_id = ?", (user_id,))
+            await conn.execute("UPDATE campaigns SET is_running = 0, stop_reason = 'access_removed' WHERE owner_id = ? AND is_running != 0", (user_id,))
             await conn.commit()
             return cursor.rowcount > 0
 
     async def stop_for_flood_wait(self, seconds: int):
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("BEGIN IMMEDIATE")
-            await conn.execute("UPDATE campaigns SET is_running = 0 WHERE is_running != 0")
+            await conn.execute("UPDATE campaigns SET is_running = 0, stop_reason = 'flood' WHERE is_running != 0")
             await conn.execute(
                 "UPDATE runtime_safety SET flood_until = MAX(flood_until, ?) WHERE id = 1",
                 (time.time() + max(0, seconds),),
@@ -167,7 +183,7 @@ class Database:
     async def stop_account_for_flood(self, user_id: int, seconds: int):
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("BEGIN IMMEDIATE")
-            await conn.execute("UPDATE campaigns SET is_running = 0 WHERE owner_id = ?", (user_id,))
+            await conn.execute("UPDATE campaigns SET is_running = 0, stop_reason = 'flood' WHERE owner_id = ? AND is_running != 0", (user_id,))
             await conn.execute("UPDATE account_sessions SET flood_until = MAX(flood_until, ?) WHERE user_id = ?", (time.time() + max(0, seconds), user_id))
             await conn.commit()
 
@@ -356,12 +372,12 @@ class Database:
                 logger.info(f"Deleted campaign {campaign_id}")
             return deleted
     
-    async def set_campaign_running(self, campaign_id: int, is_running: bool):
+    async def set_campaign_running(self, campaign_id: int, is_running: bool, reason: str = "manual"):
         """Set campaign running state."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "UPDATE campaigns SET is_running = ? WHERE id = ?",
-                (1 if is_running else 0, campaign_id)
+                "UPDATE campaigns SET is_running = ?, stop_reason = ? WHERE id = ?",
+                (1 if is_running else 0, None if is_running else reason, campaign_id)
             )
             await db.commit()
             logger.info(f"Campaign {campaign_id} running state: {is_running}")
@@ -371,7 +387,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "UPDATE campaigns SET is_running = 1 WHERE id = ? AND is_running = 0",
+                "UPDATE campaigns SET is_running = 1, stop_reason = NULL WHERE id = ? AND is_running = 0",
                 (campaign_id,),
             )
             if not cursor.rowcount:
@@ -393,6 +409,22 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_campaign_status(self, campaign_id):
+        """Read a consistent status snapshot; history is independent of schedule resets."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("""
+                SELECT c.*,
+                    (SELECT COUNT(*) FROM messages WHERE campaign_id=c.id) AS message_count,
+                    (SELECT COUNT(*) FROM groups WHERE campaign_id=c.id) AS group_count,
+                    (SELECT COUNT(*) FROM groups WHERE campaign_id=c.id AND is_enabled=1) AS enabled_group_count,
+                    (SELECT MIN(next_attempt_at) FROM groups WHERE campaign_id=c.id AND is_enabled=1) AS next_attempt_at,
+                    COALESCE((SELECT flood_until FROM account_sessions WHERE user_id=c.owner_id), 0) AS flood_until
+                FROM campaigns c WHERE c.id=?
+            """, (campaign_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
     
     # ===== MESSAGE OPERATIONS =====
     
@@ -401,13 +433,15 @@ class Database:
         campaign_id: int,
         text: Optional[str] = None,
         media_type: Optional[str] = None,
-        media_id: Optional[str] = None
+        media_id: Optional[str] = None,
+        entities_json: Optional[str] = None,
+        media_metadata: Optional[Dict] = None,
     ) -> int:
         """Add a message variant to a campaign. Returns message ID."""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "INSERT INTO messages (campaign_id, text, media_type, media_id) VALUES (?, ?, ?, ?)",
-                (campaign_id, text, media_type, media_id)
+                "INSERT INTO messages (campaign_id, text, media_type, media_id, entities_json, media_metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (campaign_id, text, media_type, media_id, entities_json, json.dumps(media_metadata or {}))
             )
             await db.commit()
             message_id = cursor.lastrowid
@@ -435,6 +469,27 @@ class Database:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def replace_message(self, campaign_id, message_id, text, media_type, media_id, entities_json, media_metadata):
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute(
+                "UPDATE messages SET text=?, media_type=?, media_id=?, entities_json=?, media_metadata=? WHERE id=? AND campaign_id=?",
+                (text, media_type, media_id, entities_json, json.dumps(media_metadata or {}), message_id, campaign_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def delete_campaign_message(self, campaign_id, message_id):
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute("DELETE FROM messages WHERE id=? AND campaign_id=?", (message_id, campaign_id))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def cache_group_title(self, campaign_id, group_id, title):
+        if title:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute("UPDATE groups SET group_title=? WHERE campaign_id=? AND id=?", (title, campaign_id, group_id))
+                await conn.commit()
     
     async def delete_message(self, message_id: int) -> bool:
         """Delete a message. Returns True if deleted."""
@@ -469,7 +524,7 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
                 "SELECT c.min_delay, c.max_delay FROM groups g JOIN campaigns c ON c.id = g.campaign_id "
-                "WHERE g.id = ? AND c.id = ? AND c.is_running = 1 AND g.next_attempt_at <= ?",
+                "WHERE g.id = ? AND c.id = ? AND c.is_running = 1 AND g.is_enabled = 1 AND g.next_attempt_at <= ?",
                 (group_id, campaign_id, now),
             )
             row = await cursor.fetchone()
@@ -480,6 +535,7 @@ class Database:
                 "UPDATE groups SET last_attempt_at = ?, next_attempt_at = ? WHERE id = ?",
                 (now, now + random.randint(row[0], row[1]), group_id),
             )
+            await conn.execute("UPDATE campaigns SET last_attempt_at = ? WHERE id = ?", (now, campaign_id))
             await conn.commit()
             return True
 
@@ -499,7 +555,7 @@ class Database:
                 )
             await conn.commit()
 
-    async def add_group_for_owner(self, campaign_id: int, owner_id: int, group_link: str):
+    async def add_group_for_owner(self, campaign_id: int, owner_id: int, group_link: str, group_title=None):
         """Atomically check campaign ownership and insert a selected group."""
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("PRAGMA foreign_keys = ON")
@@ -511,8 +567,8 @@ class Database:
                 await conn.rollback()
                 return None
             cursor = await conn.execute(
-                "INSERT OR IGNORE INTO groups (campaign_id, group_link) VALUES (?, ?)",
-                (campaign_id, group_link),
+                "INSERT OR IGNORE INTO groups (campaign_id, group_link, group_title) VALUES (?, ?, ?)",
+                (campaign_id, group_link, group_title),
             )
             await conn.commit()
             return cursor.rowcount > 0
@@ -559,6 +615,33 @@ class Database:
             if deleted:
                 logger.info(f"Deleted group {group_id}")
             return deleted
+
+    async def get_group(self, campaign_id, group_id):
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT * FROM groups WHERE campaign_id=? AND id=?", (campaign_id, group_id))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def set_group_enabled(self, campaign_id, group_id, owner_id, enabled):
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute(
+                "UPDATE groups SET is_enabled=? WHERE campaign_id=? AND id=? "
+                "AND EXISTS (SELECT 1 FROM campaigns WHERE id=? AND owner_id=?)",
+                (int(enabled), campaign_id, group_id, campaign_id, owner_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def delete_group_for_owner(self, campaign_id, group_id, owner_id):
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute(
+                "DELETE FROM groups WHERE campaign_id=? AND id=? "
+                "AND EXISTS (SELECT 1 FROM campaigns WHERE id=? AND owner_id=?)",
+                (campaign_id, group_id, campaign_id, owner_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
     
     async def clear_campaign_groups(self, campaign_id: int) -> int:
         """Delete all groups for a campaign. Returns count of deleted groups."""

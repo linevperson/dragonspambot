@@ -41,7 +41,7 @@ class GroupPickerTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(handlers.db, "get_campaign_groups", AsyncMock(return_value=[])), \
                 patch.object(handlers.db, "add_group_for_owner", AsyncMock(return_value=True)) as add:
             await handlers.choose_groups_save(self.message, self.state, user_id=42, is_owner=True)
-        add.assert_awaited_once_with(5, 42, "-100123")
+        add.assert_awaited_once_with(5, 42, "-100123", "A & B")
         client.storage.save.assert_awaited_once()
         self.assertIn("A &amp; B", self.message.answer.await_args.args[0])
 
