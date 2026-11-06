@@ -2,6 +2,10 @@
 from pyrogram import errors
 
 
+class DeliveryUncertainError(Exception):
+    """A Telegram client/session failure left actual delivery uncertain."""
+
+
 MEDIA_ERRORS = {
     errors.ChatSendVideosForbidden: ({"video"}, "В группе запрещены видео"),
     errors.ChatSendRoundvideosForbidden: ({"video_note"}, "В группе запрещены кружки"),

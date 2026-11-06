@@ -21,7 +21,7 @@ from spammer import flood_wait_remaining
 from spammer import normalize_group_destination
 from post_content import serialize_entities, bot_entities
 from campaign_status import format_campaign_status, format_attempt_time
-from spammer import campaign_sending, campaign_storage_blocked
+from spammer import campaign_sending, campaign_storage_waiting
 from pyrogram.errors import SessionPasswordNeeded, FloodWait
 
 logger = logging.getLogger(__name__)
@@ -534,7 +534,7 @@ async def show_campaign(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Кампания не найдена!", show_alert=True)
         return
     
-    status = format_campaign_status(campaign, campaign_id in campaign_sending, safety_blocked=campaign["owner_id"] in accounts.failed_flood_writes, storage_blocked=campaign_id in campaign_storage_blocked)
+    status = format_campaign_status(campaign, campaign_id in campaign_sending, safety_blocked=campaign["owner_id"] in accounts.failed_flood_writes, storage_waiting=campaign_id in campaign_storage_waiting)
     
     text = (
         f"📊 <b>{escape(campaign['name'])}</b>\n\n"
@@ -1212,8 +1212,8 @@ async def config_delay_save(message: Message, state: FSMContext):
 async def start_campaign(callback: CallbackQuery, user_id: int, owner_id: int):
     """Start a campaign."""
     campaign_id = int(callback.data.split(":")[1])
-    if campaign_id in campaign_storage_blocked:
-        await callback.answer("Кампания заблокирована после сбоя БД. Проверьте базу и перезапустите бота.", show_alert=True)
+    if campaign_id in campaign_storage_waiting:
+        await callback.answer("Кампания ожидает базу и сохранит очередь автоматически. Повторный запуск не требуется.", show_alert=True)
         return
     if user_id in accounts.failed_flood_writes:
         await callback.answer("Аккаунт приостановлен. Проверьте ограничения Telegram и ошибки в логах перед перезапуском бота.", show_alert=True)

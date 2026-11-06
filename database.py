@@ -642,6 +642,26 @@ class Database:
                 )
             await conn.commit()
 
+    async def complete_group_attempt(self, campaign_id, group_id, now, delivered_message_id=None):
+        """Atomically persist the delivered post and its completion-based interval."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "SELECT min_delay, max_delay FROM campaigns WHERE id=?", (campaign_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                await conn.execute(
+                    "UPDATE groups SET last_attempt_at=?, next_attempt_at=? WHERE campaign_id=? AND id=?",
+                    (now, now + random.randint(row[0], row[1]), campaign_id, group_id),
+                )
+                if delivered_message_id is not None:
+                    await conn.execute(
+                        "UPDATE groups SET last_message_id=?, rotation_initialized=1, last_error=NULL, last_error_at=NULL WHERE campaign_id=? AND id=?",
+                        (delivered_message_id, campaign_id, group_id),
+                    )
+            await conn.commit()
+
     async def add_group_for_owner(self, campaign_id: int, owner_id: int, group_link: str, group_title=None):
         """Atomically check campaign ownership and insert a selected group."""
         async with aiosqlite.connect(self.db_path) as conn:

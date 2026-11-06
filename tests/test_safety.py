@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import sqlite3
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,11 +14,13 @@ from database import Database
 
 class SafetyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        spammer.account_flood_pending.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(str(Path(self.tmp.name) / "test.db"))
         await self.db.init_db(1)
 
     async def asyncTearDown(self):
+        spammer.account_flood_pending.clear()
         self.tmp.cleanup()
 
     async def campaign(self, owner):
@@ -100,6 +103,8 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         lock = asyncio.Lock()
         manager = SimpleNamespace(lock=lambda _: lock, get_client=AsyncMock(return_value=fake_bot), failed_flood_writes=set())
         with patch.object(spammer, "db", self.db), patch.object(spammer, "accounts", manager), \
-                patch.object(self.db, "stop_account_for_flood", AsyncMock(side_effect=RuntimeError("db failure"))):
-            await spammer.run_campaign_spam(campaign_id)
+                    patch.object(self.db, "stop_account_for_flood", AsyncMock(side_effect=sqlite3.OperationalError("db failure"))), \
+                    patch.object(spammer.asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await spammer.run_campaign_spam(campaign_id)
             self.assertGreater(await spammer.flood_wait_remaining(1), 0)

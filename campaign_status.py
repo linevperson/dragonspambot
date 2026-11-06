@@ -10,13 +10,13 @@ def format_attempt_time(timestamp):
     return datetime.fromtimestamp(timestamp, ZoneInfo("Europe/Kyiv")).strftime("%d.%m.%Y %H:%M:%S")
 
 
-def format_campaign_status(snapshot, sending=False, now=None, safety_blocked=False, storage_blocked=False):
+def format_campaign_status(snapshot, sending=False, now=None, safety_blocked=False, storage_waiting=False):
     now = time.time() if now is None else now
     running = bool(snapshot["is_running"])
     blocked = snapshot["flood_until"] > now or safety_blocked
     next_time = "—"
-    if storage_blocked:
-        status = "🛑 Остановлена: ошибка сохранения базы"
+    if storage_waiting:
+        status = "⏳ Техническое ожидание базы — продолжит автоматически после сохранения"
     elif blocked and (running or snapshot.get("stop_reason") == "flood" or safety_blocked):
         status = "🛑 Остановлена ограничением Telegram"
     elif not running:

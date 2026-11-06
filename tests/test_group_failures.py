@@ -16,7 +16,9 @@ from database import Database
 
 class GroupFailureTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        spammer.campaign_storage_blocked.clear()
+        spammer.campaign_storage_waiting.clear()
+        spammer.campaign_storage_sessions.clear()
+        spammer.account_flood_pending.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "test.db"
         self.db = Database(str(self.path))
@@ -35,13 +37,15 @@ class GroupFailureTests(unittest.IsolatedAsyncioTestCase):
         self.manager = SimpleNamespace(lock=lambda _: asyncio.Lock(), get_client=AsyncMock(), failed_flood_writes=set())
 
     async def asyncTearDown(self):
-        spammer.campaign_storage_blocked.clear()
+        spammer.campaign_storage_waiting.clear()
+        spammer.campaign_storage_sessions.clear()
+        spammer.account_flood_pending.clear()
         self.tmp.cleanup()
 
     async def download(self, file_id, destination):
         destination.write(file_id.encode())
 
-    async def run_worker(self, error_for=lambda group, kind: None, count=6, horizon=1200, notify_error=False):
+    async def run_worker(self, error_for=lambda group, kind: None, count=6, horizon=1200, notify_error=False, on_sleep=None):
         async def send(kind, kwargs):
             self.events.append((kwargs["chat_id"], kind, self.clock[0]))
             exc = error_for(kwargs["chat_id"], kind)
@@ -56,6 +60,8 @@ class GroupFailureTests(unittest.IsolatedAsyncioTestCase):
         if notify_error:
             self.bot.send_message.side_effect = RuntimeError("notifications unavailable")
         async def sleep(seconds):
+            if on_sleep:
+                await on_sleep(seconds)
             if len(self.events) >= count or self.clock[0] >= horizon:
                 raise asyncio.CancelledError
             self.clock[0] += seconds
@@ -143,28 +149,34 @@ class GroupFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
         self.assertIn("результат отправки не подтверждён", self.bot.send_message.await_args.args[1])
 
-    async def test_cursor_write_failure_stops_campaign_before_duplicate(self):
-        with patch.object(self.db, "record_group_message", AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))):
+    async def test_database_outage_waits_without_stopping_or_duplicate_send(self):
+        with patch.object(self.db, "complete_group_attempt", AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))):
             await self.run_worker()
         self.assertEqual(len(self.events), 1)
-        self.assertIn(self.cid, spammer.campaign_storage_blocked)
-        self.assertEqual((await self.db.get_campaign(self.cid))["stop_reason"], "storage")
-        await self.run_worker()
-        self.assertEqual(len(self.events), 1)
-
-    async def test_schedule_write_failure_is_not_swallowed_as_group_error(self):
-        with patch.object(self.db, "finish_group_attempt", AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))):
-            await self.run_worker()
-        self.assertEqual(len(self.events), 1)
-        self.assertIn(self.cid, spammer.campaign_storage_blocked)
-
-    async def test_in_memory_guard_works_even_when_stop_cannot_be_saved(self):
-        with patch.object(self.db, "record_group_message", AsyncMock(side_effect=sqlite3.OperationalError("locked"))), \
-                patch.object(self.db, "set_campaign_running", AsyncMock(side_effect=sqlite3.OperationalError("locked"))):
-            await self.run_worker()
-        self.assertIn(self.cid, spammer.campaign_storage_blocked)
+        self.assertIn(self.cid, spammer.campaign_storage_waiting)
         self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
+        # Retry the retained write before any next Telegram request.
         await self.run_worker()
+        self.assertEqual(self.events[0][1], "video_note")
+        self.assertEqual(self.events[1][1], "text")
+
+    async def test_retained_write_is_flushed_before_manual_stop_is_obeyed(self):
+        with patch.object(self.db, "complete_group_attempt", AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))):
+            await self.run_worker()
+        self.assertEqual(len(self.events), 1)
+        await self.db.set_campaign_running(self.cid, False)
+        await self.run_worker()
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual((await self.db.get_group(self.cid, self.groups[0]["id"]))["last_message_id"], self.circle)
+        self.assertNotIn(self.cid, spammer.campaign_storage_waiting)
+
+    async def test_technical_wait_does_not_try_to_save_full_stop(self):
+        with patch.object(self.db, "complete_group_attempt", AsyncMock(side_effect=sqlite3.OperationalError("locked"))), \
+                patch.object(self.db, "set_campaign_running", AsyncMock()) as stop:
+            await self.run_worker()
+        stop.assert_not_awaited()
+        self.assertIn(self.cid, spammer.campaign_storage_waiting)
+        self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
         self.assertEqual(len(self.events), 1)
 
     async def test_account_restriction_is_not_misclassified_as_local_error(self):
@@ -193,15 +205,89 @@ class GroupFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Медленный режим", text)
         self.assertNotIn("сейчас / в очереди", text)
 
-    async def test_storage_safety_guard_rejects_manual_start(self):
-        spammer.campaign_storage_blocked.add(self.cid)
+    async def test_technical_wait_does_not_need_another_start(self):
+        spammer.campaign_storage_waiting.add(self.cid)
         callback = SimpleNamespace(data=f"start_campaign:{self.cid}", answer=AsyncMock())
         await handlers.start_campaign(callback, 42, 42)
-        self.assertIn("сбоя БД", callback.answer.await_args.args[0])
+        self.assertIn("Повторный запуск не требуется", callback.answer.await_args.args[0])
 
     async def test_notification_ledger_failure_alone_does_not_stop_campaign(self):
         with patch.object(self.db, "claim_group_notification", AsyncMock(side_effect=sqlite3.OperationalError("notification ledger locked"))):
             await self.run_worker(lambda group, kind: RuntimeError() if group == "group_A" else None)
         self.assertEqual(len([e for e in self.events if e[0] == "group_B"]), 3)
         self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
-        self.assertNotIn(self.cid, spammer.campaign_storage_blocked)
+        self.assertNotIn(self.cid, spammer.campaign_storage_waiting)
+
+    async def test_transient_database_failure_recovers_in_same_worker_without_resending_post(self):
+        original = self.db.complete_group_attempt
+        calls = []
+        async def complete(*args):
+            calls.append(args)
+            if len(calls) <= 3:
+                self.assertEqual(len(self.events), 1)
+                raise sqlite3.OperationalError("temporarily locked")
+            return await original(*args)
+        with patch.object(self.db, "complete_group_attempt", side_effect=complete):
+            await self.run_worker(count=4)
+        self.assertEqual([(g, kind) for g, kind, _ in self.events], [
+            ("group_A", "video_note"), ("group_B", "text"), ("group_A", "text"), ("group_B", "video_note")])
+        self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
+        self.assertNotIn(self.cid, spammer.campaign_storage_waiting)
+        messages = [call.args[1] for call in self.bot.send_message.await_args_list]
+        self.assertEqual(sum("техническое ожидание" in text for text in messages), 1)
+        self.assertEqual(sum("база снова доступна" in text for text in messages), 1)
+        self.assertEqual(calls[0], calls[1])  # Retry the same completion timestamp and delivered ID.
+
+    async def test_manual_stop_during_wait_is_not_auto_resumed(self):
+        original = self.db.complete_group_attempt
+        attempts = [0]
+        async def complete(*args):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise sqlite3.OperationalError("locked")
+            return await original(*args)
+        async def user_stop(seconds):
+            if self.cid in spammer.campaign_storage_waiting:
+                await self.db.set_campaign_running(self.cid, False)
+        with patch.object(self.db, "complete_group_attempt", side_effect=complete):
+            await self.run_worker(on_sleep=user_stop)
+        self.assertEqual(len(self.events), 1)
+        self.assertFalse((await self.db.get_campaign(self.cid))["is_running"])
+        self.assertEqual((await self.db.get_group(self.cid, self.groups[0]["id"]))["last_message_id"], self.circle)
+
+    async def test_sqlite_failure_inside_telegram_send_is_uncertain_group_result_not_send_retry(self):
+        await self.run_worker(lambda group, kind: sqlite3.OperationalError("session storage failed") if group == "group_A" else None, count=4)
+        self.assertEqual(len([event for event in self.events if event[0] == "group_A"]), 1)
+        self.assertFalse((await self.db.get_group(self.cid, self.groups[0]["id"]))["is_enabled"])
+        self.assertTrue((await self.db.get_campaign(self.cid))["is_running"])
+        self.assertNotIn(self.cid, spammer.campaign_storage_waiting)
+
+    async def test_flood_persistence_recovers_without_leaving_permanent_account_guard(self):
+        original = self.db.stop_account_for_flood
+        attempts = [0]
+        async def persist(*args):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise sqlite3.OperationalError("locked")
+            return await original(*args)
+        with patch.object(self.db, "stop_account_for_flood", side_effect=persist):
+            await self.run_worker(lambda group, kind: FloodWait(300))
+        self.assertEqual(len(self.events), 1)
+        self.assertFalse((await self.db.get_campaign(self.cid))["is_running"])
+        self.assertNotIn(42, self.manager.failed_flood_writes)
+        with patch("database.time.time", return_value=self.clock[0]):
+            self.assertGreater(await self.db.account_flood_remaining(42), 0)
+
+    async def test_session_connection_database_failure_retries_before_sending_any_post(self):
+        attempts = [0]
+        async def connect(*args):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                self.assertEqual(len(self.events), 0)
+                raise sqlite3.OperationalError("session busy before any send")
+            return self.manager.get_client.return_value
+        self.manager.get_client.side_effect = connect
+        await self.run_worker(count=4)
+        self.assertEqual([(g, kind) for g, kind, _ in self.events], [
+            ("group_A", "video_note"), ("group_B", "text"), ("group_A", "text"), ("group_B", "video_note")])
+        self.assertNotIn(self.cid, spammer.campaign_storage_waiting)
