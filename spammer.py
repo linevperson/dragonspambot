@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 import time
 import json
 from io import BytesIO
@@ -49,13 +48,12 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
             continue
 
         now = time.time()
-        due_groups = [group for group in groups if group["next_attempt_at"] <= now]
+        due_groups = sorted((group for group in groups if group["next_attempt_at"] <= now), key=lambda group: group["id"])
         if not due_groups:
             earliest = min(group["next_attempt_at"] for group in groups)
             await asyncio.sleep(min(5, max(0.1, earliest - now)))
             continue
 
-        random.shuffle(due_groups)
         for group in due_groups:
             group_link = group["group_link"]
             destination = normalize_group_destination(group_link)

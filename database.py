@@ -108,6 +108,8 @@ class Database:
             if "last_message_id" not in group_columns:
                 # Intentionally not a foreign key: deleting a post must not rewind rotation.
                 await db.execute("ALTER TABLE groups ADD COLUMN last_message_id INTEGER")
+            if "rotation_initialized" not in group_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN rotation_initialized INTEGER NOT NULL DEFAULT 0")
             if "last_attempt_at" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN last_attempt_at REAL")
             if "next_attempt_at" not in group_columns:
@@ -522,23 +524,34 @@ class Database:
     # ===== GROUP OPERATIONS =====
 
     async def get_next_group_message(self, campaign_id: int, group_id: int):
-        """Choose the next surviving post after this group's last delivered post."""
+        """Stagger initial posts by group position, then advance each group independently."""
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
+            await conn.execute("BEGIN")
             cursor = await conn.execute("""
-                SELECT m.* FROM messages m JOIN groups g ON g.campaign_id=m.campaign_id
-                WHERE g.id=? AND g.campaign_id=? AND g.is_enabled=1
-                ORDER BY CASE WHEN g.last_message_id IS NULL OR m.id>g.last_message_id THEN 0 ELSE 1 END, m.id
-                LIMIT 1
+                SELECT g.*, (SELECT COUNT(*) FROM groups preceding
+                    WHERE preceding.campaign_id=g.campaign_id AND preceding.id<g.id) AS group_position
+                FROM groups g WHERE g.id=? AND g.campaign_id=? AND g.is_enabled=1
             """, (group_id, campaign_id))
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+            group = await cursor.fetchone()
+            if not group:
+                return None
+            cursor = await conn.execute("SELECT * FROM messages WHERE campaign_id=? ORDER BY id", (campaign_id,))
+            messages = await cursor.fetchall()
+            if not messages:
+                return None
+            if not group["rotation_initialized"]:
+                index = group["group_position"] % len(messages)
+            else:
+                last_id = group["last_message_id"]
+                index = next((i for i, message in enumerate(messages) if last_id is None or message["id"] > last_id), 0)
+            return dict(messages[index])
 
     async def record_group_message(self, campaign_id: int, group_id: int, message_id: int):
         """Advance only this group's rotation after Telegram confirms delivery."""
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute(
-                "UPDATE groups SET last_message_id=? WHERE id=? AND campaign_id=?",
+                "UPDATE groups SET last_message_id=?, rotation_initialized=1 WHERE id=? AND campaign_id=?",
                 (message_id, group_id, campaign_id),
             )
             await conn.commit()
