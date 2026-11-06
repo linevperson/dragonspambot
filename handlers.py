@@ -21,7 +21,7 @@ from spammer import flood_wait_remaining
 from spammer import normalize_group_destination
 from post_content import serialize_entities, bot_entities
 from campaign_status import format_campaign_status, format_attempt_time
-from spammer import campaign_sending
+from spammer import campaign_sending, campaign_storage_blocked
 from pyrogram.errors import SessionPasswordNeeded, FloodWait
 
 logger = logging.getLogger(__name__)
@@ -534,7 +534,7 @@ async def show_campaign(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Кампания не найдена!", show_alert=True)
         return
     
-    status = format_campaign_status(campaign, campaign_id in campaign_sending, safety_blocked=campaign["owner_id"] in accounts.failed_flood_writes)
+    status = format_campaign_status(campaign, campaign_id in campaign_sending, safety_blocked=campaign["owner_id"] in accounts.failed_flood_writes, storage_blocked=campaign_id in campaign_storage_blocked)
     
     text = (
         f"📊 <b>{escape(campaign['name'])}</b>\n\n"
@@ -1034,7 +1034,8 @@ async def show_group_details(callback, campaign_id, group_id):
     enabled = bool(group["is_enabled"])
     next_time = "—"
     if enabled and campaign["is_running"]:
-        next_time = format_attempt_time(group["next_attempt_at"]) if group["next_attempt_at"] > time.time() else "сейчас / в очереди"
+        due = max(group["next_attempt_at"], group["retry_after"])
+        next_time = format_attempt_time(due) if due > time.time() else "сейчас / в очереди"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏸ Выключить группу" if enabled else "▶️ Включить группу",
                               callback_data=f"group_{'disable' if enabled else 'enable'}:{campaign_id}:{group_id}")],
@@ -1046,9 +1047,11 @@ async def show_group_details(callback, campaign_id, group_id):
         f"Статус: {'🟢 Включена' if enabled else '⏸ Выключена'}\n"
         f"Последняя попытка: {format_attempt_time(group['last_attempt_at'])}\n"
         f"Ближайшая попытка: {next_time}\n"
+        f"Последняя ошибка: {escape(group['last_error'] or 'нет')}\n"
+        f"Причина приостановки: {escape(group['pause_reason'] or 'нет')}\n"
         "Время: Киев.\n\n"
         "Выключенная группа остаётся в кампании, но не участвует в рассылке. "
-        "При включении сохраняется прежнее расписание. Уже начатый Telegram-запрос отменить нельзя."
+        "При включении сохраняется расписание и срок Telegram, а ограничения форматов проверяются заново. Уже начатый Telegram-запрос отменить нельзя."
     )
     try:
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -1209,6 +1212,12 @@ async def config_delay_save(message: Message, state: FSMContext):
 async def start_campaign(callback: CallbackQuery, user_id: int, owner_id: int):
     """Start a campaign."""
     campaign_id = int(callback.data.split(":")[1])
+    if campaign_id in campaign_storage_blocked:
+        await callback.answer("Кампания заблокирована после сбоя БД. Проверьте базу и перезапустите бота.", show_alert=True)
+        return
+    if user_id in accounts.failed_flood_writes:
+        await callback.answer("Аккаунт приостановлен. Проверьте ограничения Telegram и ошибки в логах перед перезапуском бота.", show_alert=True)
+        return
     campaign = await db.get_campaign(campaign_id)
     
     if not campaign:

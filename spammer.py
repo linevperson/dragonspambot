@@ -2,23 +2,94 @@ import asyncio
 import logging
 import time
 import json
+import sqlite3
+from html import escape
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict
 
 from pyrogram import Client, enums
-from pyrogram.errors import FloodWait, ChatWriteForbidden, UserBannedInChannel, ChannelPrivate, ChatAdminRequired, SlowmodeWait
+from pyrogram.errors import FloodWait, ChatWriteForbidden, UserBannedInChannel, ChannelPrivate, ChatAdminRequired, SlowmodeWait, PeerFlood, UserRestricted, Unauthorized
 from pyrogram.errors.exceptions.bad_request_400 import PeerIdInvalid, UsernameInvalid
 
 from database import db
 from accounts import accounts
 from post_content import sender_entities
+from delivery_errors import media_restriction
 
 logger = logging.getLogger(__name__)
 
 # Dictionary to track running campaign tasks
 campaign_tasks: Dict[int, asyncio.Task] = {}
 campaign_sending: Dict[int, int] = {}
+campaign_storage_blocked = set()
+
+
+async def send_notice(admin_bot, owner_id, text):
+    if not admin_bot or not hasattr(admin_bot, "send_message"):
+        return
+    try:
+        await asyncio.wait_for(admin_bot.send_message(owner_id, text, parse_mode="HTML"), timeout=10)
+    except Exception as exc:
+        logger.warning("Could not deliver owner notification: %s", type(exc).__name__)
+
+
+async def notify_group_error(admin_bot, campaign, group, reason, action, key):
+    if not admin_bot or not hasattr(admin_bot, "send_message"):
+        return
+    try:
+        claimed = await db.claim_group_notification(campaign["id"], group["id"], key, time.time())
+    except sqlite3.Error as exc:
+        # A notification ledger is not the delivery cursor/schedule. Do not halt
+        # healthy groups solely because this optional notification cannot be claimed.
+        logger.warning("Could not reserve error notification: %s", type(exc).__name__)
+        return
+    if not claimed:
+        return
+    title = group.get("group_title") or group["group_link"]
+    await send_notice(admin_bot, campaign["owner_id"],
+        f"⚠️ Не удалось отправить пост\nКампания: <b>{escape(campaign['name'][:200])}</b>\n"
+        f"Группа: <b>{escape(title[:180])}</b>\nПричина: {escape(reason)}\n\n{escape(action)}")
+
+
+async def handle_group_error(exc, campaign, group, admin_bot):
+    cid, gid = campaign["id"], group["id"]
+    restriction = media_restriction(exc)
+    if isinstance(exc, SlowmodeWait):
+        seconds = max(1, int(exc.value))
+        reason = f"Telegram включил медленный режим: ждать {seconds} сек."
+        await db.record_group_failure(cid, gid, reason, retry_after=time.time() + seconds)
+        action = "Пост сохранён в очереди. Эта группа ждёт не меньше срока Telegram и интервала кампании; остальные продолжают рассылку."
+    elif restriction:
+        blocked, reason = restriction
+        await db.record_group_failure(cid, gid, reason, blocked_types=blocked)
+        if await db.get_next_group_message(cid, gid):
+            action = "Запрещённый формат пропущен только в этой группе. Следующая попытка — с обычным интервалом. Остальные группы продолжают рассылку."
+        else:
+            reason += "; нет подходящих вариантов постов"
+            await db.record_group_failure(cid, gid, reason, pause=True)
+            action = "Приостановлена только эта группа. Добавьте подходящий пост или измените права и включите группу в её карточке."
+    elif isinstance(exc, (ChatWriteForbidden, UserBannedInChannel, ChannelPrivate, ChatAdminRequired, PeerIdInvalid, UsernameInvalid)):
+        reason = {
+            ChatWriteForbidden: "Нет разрешения писать в группу",
+            UserBannedInChannel: "Отправляющий аккаунт заблокирован в группе",
+            ChannelPrivate: "Группа недоступна отправляющему аккаунту",
+            ChatAdminRequired: "Для отправки нужны права администратора группы",
+            PeerIdInvalid: "Не удалось найти группу среди доступных отправителю чатов",
+            UsernameInvalid: "Некорректный адрес группы",
+        }.get(type(exc), "Нет доступа к отправке в группу")
+        await db.record_group_failure(cid, gid, reason, pause=True)
+        action = "Приостановлена только эта группа. Проверьте доступ и включите её в карточке группы. Остальные группы продолжают рассылку."
+    elif isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        reason = "Сетевой сбой: результат отправки не подтверждён"
+        await db.record_group_failure(cid, gid, reason, pause=True)
+        action = "Приостановлена только эта группа, чтобы не повторить уже доставленный пост. Проверьте чат перед повторным включением. Остальные группы продолжают рассылку."
+    else:
+        reason = f"Ошибка отправки ({type(exc).__name__})"
+        await db.record_group_failure(cid, gid, reason)
+        action = "Пост остаётся в очереди этой группы до следующей попытки по интервалу. Остальные группы продолжают рассылку."
+    logger.warning("[Campaign %s] Group %s: %s", cid, gid, reason)
+    await notify_group_error(admin_bot, campaign, group, reason, action, type(exc).__name__)
 
 
 async def flood_wait_remaining(user_id):
@@ -35,6 +106,28 @@ def normalize_group_destination(group_link):
 
 
 async def run_campaign_spam(campaign_id: int, admin_bot=None):
+    campaign = None
+    if campaign_id in campaign_storage_blocked:
+        return
+    try:
+        campaign = await db.get_campaign(campaign_id)
+        await _run_campaign_spam(campaign_id, admin_bot)
+    except sqlite3.Error as exc:
+        # Never treat uncertain persistence after a send as a harmless chat failure.
+        campaign_storage_blocked.add(campaign_id)
+        campaign_sending.pop(campaign_id, None)
+        try:
+            await db.set_campaign_running(campaign_id, False, reason="storage")
+        except Exception:
+            logger.error("Could not persist storage safety stop for campaign %s", campaign_id)
+        logger.error("Campaign %s stopped: database failure (%s)", campaign_id, type(exc).__name__)
+        if campaign:
+            await send_notice(admin_bot, campaign["owner_id"],
+                f"🛑 Кампания <b>{escape(campaign['name'][:200])}</b> остановлена: не удалось безопасно сохранить очередь или расписание в базе. "
+                "Это не ошибка отдельной группы. Проверьте базу и последние сообщения; после устранения сбоя перезапустите бота.")
+
+
+async def _run_campaign_spam(campaign_id: int, admin_bot=None):
     """Send to each group when its independently persisted interval is due."""
     while True:
         campaign = await db.get_campaign(campaign_id)
@@ -48,9 +141,9 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
             continue
 
         now = time.time()
-        due_groups = sorted((group for group in groups if group["next_attempt_at"] <= now), key=lambda group: group["id"])
+        due_groups = sorted((group for group in groups if max(group["next_attempt_at"], group["retry_after"]) <= now), key=lambda group: group["id"])
         if not due_groups:
-            earliest = min(group["next_attempt_at"] for group in groups)
+            earliest = min(max(group["next_attempt_at"], group["retry_after"]) for group in groups)
             await asyncio.sleep(min(5, max(0.1, earliest - now)))
             continue
 
@@ -67,17 +160,26 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
                         return
                     try:
                         client = await accounts.get_client(campaign["owner_id"])
+                    except (sqlite3.Error, PeerFlood, UserRestricted, Unauthorized):
+                        raise
                     except Exception as exc:
                         await db.set_campaign_running(campaign_id, False, reason="account")
                         logger.warning("[Campaign %s] Could not connect account: %s", campaign_id, type(exc).__name__)
+                        await send_notice(admin_bot, campaign["owner_id"],
+                            f"🛑 Кампания <b>{escape(campaign['name'][:200])}</b> остановлена: не удалось подключить отправляющий аккаунт. Проверьте подключение через /start.")
                         return
                     if not client:
                         await db.set_campaign_running(campaign_id, False, reason="account")
+                        await send_notice(admin_bot, campaign["owner_id"],
+                            f"🛑 Кампания <b>{escape(campaign['name'][:200])}</b> остановлена: отправляющий аккаунт не подключён. Подключите его через /start.")
                         return
 
                     # Read fresh content and the group's persisted rotation under the account lock.
                     message = await db.get_next_group_message(campaign_id, group["id"])
                     if not message:
+                        await db.record_group_failure(campaign_id, group["id"], "Нет подходящих вариантов постов для этой группы", pause=True)
+                        await notify_group_error(admin_bot, campaign, group, "Нет подходящих вариантов постов для этой группы",
+                            "Приостановлена только эта группа. Добавьте подходящий пост и включите группу в её карточке.", "no_compatible_posts")
                         continue
 
                     reserved = await db.reserve_group_attempt(campaign_id, group["id"], time.time())
@@ -104,16 +206,23 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
                             accounts.failed_flood_writes.add(campaign["owner_id"])
                             logger.exception("Could not persist FloodWait; account remains blocked")
                         logger.warning("Telegram FloodWait %ss: account campaigns stopped", exc.value)
+                        await notify_group_error(admin_bot, campaign, group,
+                            f"Telegram ограничил весь отправляющий аккаунт на {exc.value} сек.",
+                            "Остановлены кампании этого аккаунта. Это не локальная ошибка группы; после окончания ограничения нужен ручной запуск.", "FloodWait")
                         return
                     finally:
                         campaign_sending.pop(campaign_id, None)
                         await db.finish_group_attempt(campaign_id, group["id"], time.time())
-            except SlowmodeWait:
-                logger.warning("⏳ [Campaign %s] SlowMode in %s", campaign_id, group_link)
-            except (ChatWriteForbidden, UserBannedInChannel, ChannelPrivate, ChatAdminRequired):
-                logger.error("🚫 [Campaign %s] No access to %s", campaign_id, group_link)
+            except sqlite3.Error:
+                raise
+            except (PeerFlood, UserRestricted, Unauthorized) as exc:
+                accounts.failed_flood_writes.add(campaign["owner_id"])
+                await db.stop_account_campaigns(campaign["owner_id"], "restricted")
+                await notify_group_error(admin_bot, campaign, group, f"Ограничение или потеря авторизации всего аккаунта ({type(exc).__name__})",
+                    "Кампании этого аккаунта остановлены. Проверьте аккаунт в Telegram; это не ошибка одной группы.", type(exc).__name__)
+                return
             except Exception as exc:
-                logger.error("❓ [Campaign %s] Error in %s: %s", campaign_id, group_link, type(exc).__name__)
+                await handle_group_error(exc, campaign, group, admin_bot)
 
             if reserved:
                 # Space out different groups without exceeding a shorter configured interval.
@@ -175,6 +284,8 @@ async def campaign_monitor(admin_bot=None):
             # Start tasks for newly running campaigns
             for campaign in running_campaigns:
                 campaign_id = campaign['id']
+                if campaign_id in campaign_storage_blocked:
+                    continue
                 
                 # Check if task already exists and is running
                 if campaign_id in campaign_tasks:

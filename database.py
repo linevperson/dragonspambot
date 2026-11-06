@@ -110,6 +110,14 @@ class Database:
                 await db.execute("ALTER TABLE groups ADD COLUMN last_message_id INTEGER")
             if "rotation_initialized" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN rotation_initialized INTEGER NOT NULL DEFAULT 0")
+            for column, definition in {
+                "retry_after": "REAL NOT NULL DEFAULT 0",
+                "blocked_media_types": "TEXT NOT NULL DEFAULT '[]'",
+                "last_error": "TEXT", "last_error_at": "REAL", "pause_reason": "TEXT",
+                "notification_history": "TEXT NOT NULL DEFAULT '{}'",
+            }.items():
+                if column not in group_columns:
+                    await db.execute(f"ALTER TABLE groups ADD COLUMN {column} {definition}")
             if "last_attempt_at" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN last_attempt_at REAL")
             if "next_attempt_at" not in group_columns:
@@ -190,6 +198,11 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute("UPDATE campaigns SET is_running = 0, stop_reason = 'flood' WHERE owner_id = ? AND is_running != 0", (user_id,))
             await conn.execute("UPDATE account_sessions SET flood_until = MAX(flood_until, ?) WHERE user_id = ?", (time.time() + max(0, seconds), user_id))
+            await conn.commit()
+
+    async def stop_account_campaigns(self, user_id, reason):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("UPDATE campaigns SET is_running=0, stop_reason=? WHERE owner_id=? AND is_running!=0", (reason, user_id))
             await conn.commit()
 
     async def account_flood_remaining(self, user_id: int) -> int:
@@ -424,7 +437,7 @@ class Database:
                     (SELECT COUNT(*) FROM messages WHERE campaign_id=c.id) AS message_count,
                     (SELECT COUNT(*) FROM groups WHERE campaign_id=c.id) AS group_count,
                     (SELECT COUNT(*) FROM groups WHERE campaign_id=c.id AND is_enabled=1) AS enabled_group_count,
-                    (SELECT MIN(next_attempt_at) FROM groups WHERE campaign_id=c.id AND is_enabled=1) AS next_attempt_at,
+                    (SELECT MIN(MAX(next_attempt_at, retry_after)) FROM groups WHERE campaign_id=c.id AND is_enabled=1) AS next_attempt_at,
                     COALESCE((SELECT flood_until FROM account_sessions WHERE user_id=c.owner_id), 0) AS flood_until
                 FROM campaigns c WHERE c.id=?
             """, (campaign_id,))
@@ -545,16 +558,52 @@ class Database:
             else:
                 last_id = group["last_message_id"]
                 index = next((i for i, message in enumerate(messages) if last_id is None or message["id"] > last_id), 0)
-            return dict(messages[index])
+            blocked = set(json.loads(group["blocked_media_types"] or "[]"))
+            for offset in range(len(messages)):
+                candidate = messages[(index + offset) % len(messages)]
+                if (candidate["media_type"] or "text") not in blocked:
+                    return dict(candidate)
+            return None
 
     async def record_group_message(self, campaign_id: int, group_id: int, message_id: int):
         """Advance only this group's rotation after Telegram confirms delivery."""
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute(
-                "UPDATE groups SET last_message_id=?, rotation_initialized=1 WHERE id=? AND campaign_id=?",
+                "UPDATE groups SET last_message_id=?, rotation_initialized=1, last_error=NULL, last_error_at=NULL WHERE id=? AND campaign_id=?",
                 (message_id, group_id, campaign_id),
             )
             await conn.commit()
+
+    async def record_group_failure(self, campaign_id, group_id, reason, retry_after=0, blocked_types=(), pause=False):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute("SELECT g.blocked_media_types, c.min_delay FROM groups g JOIN campaigns c ON c.id=g.campaign_id WHERE g.campaign_id=? AND g.id=?", (campaign_id, group_id))
+            row = await cursor.fetchone()
+            if row:
+                blocked = set(json.loads(row[0] or "[]")) | set(blocked_types)
+                await conn.execute(
+                    "UPDATE groups SET last_error=?, last_error_at=?, retry_after=MAX(retry_after, ?), blocked_media_types=?, next_attempt_at=MAX(next_attempt_at, ?), "
+                    "is_enabled=CASE WHEN ? THEN 0 ELSE is_enabled END, pause_reason=CASE WHEN ? THEN ? ELSE pause_reason END "
+                    "WHERE campaign_id=? AND id=?",
+                    (reason, time.time(), retry_after, json.dumps(sorted(blocked)), time.time() + row[1], pause, pause, reason, campaign_id, group_id),
+                )
+            await conn.commit()
+
+    async def claim_group_notification(self, campaign_id, group_id, key, now, cooldown=900):
+        """At most one attempt per repeated reason/15 min, including across restarts."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute("SELECT notification_history FROM groups WHERE campaign_id=? AND id=?", (campaign_id, group_id))
+            row = await cursor.fetchone()
+            history = json.loads(row[0] or "{}") if row else {}
+            if not row or (key in history and now - history[key] < cooldown):
+                await conn.rollback()
+                return False
+            history = {reason: timestamp for reason, timestamp in history.items() if now - timestamp < cooldown}
+            history[key] = now
+            await conn.execute("UPDATE groups SET notification_history=? WHERE campaign_id=? AND id=?", (json.dumps(history), campaign_id, group_id))
+            await conn.commit()
+            return True
 
     async def reserve_group_attempt(self, campaign_id: int, group_id: int, now: float) -> bool:
         """Reserve a due attempt before network I/O to avoid immediate retries after a crash."""
@@ -562,8 +611,8 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
                 "SELECT c.min_delay, c.max_delay FROM groups g JOIN campaigns c ON c.id = g.campaign_id "
-                "WHERE g.id = ? AND c.id = ? AND c.is_running = 1 AND g.is_enabled = 1 AND g.next_attempt_at <= ?",
-                (group_id, campaign_id, now),
+                "WHERE g.id = ? AND c.id = ? AND c.is_running = 1 AND g.is_enabled = 1 AND g.next_attempt_at <= ? AND g.retry_after <= ?",
+                (group_id, campaign_id, now, now),
             )
             row = await cursor.fetchone()
             if not row:
@@ -664,9 +713,10 @@ class Database:
     async def set_group_enabled(self, campaign_id, group_id, owner_id, enabled):
         async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute(
-                "UPDATE groups SET is_enabled=? WHERE campaign_id=? AND id=? "
+                "UPDATE groups SET is_enabled=?, pause_reason=CASE WHEN ? THEN NULL ELSE pause_reason END, "
+                "blocked_media_types=CASE WHEN ? THEN '[]' ELSE blocked_media_types END WHERE campaign_id=? AND id=? "
                 "AND EXISTS (SELECT 1 FROM campaigns WHERE id=? AND owner_id=?)",
-                (int(enabled), campaign_id, group_id, campaign_id, owner_id),
+                (int(enabled), int(enabled), int(enabled), campaign_id, group_id, campaign_id, owner_id),
             )
             await conn.commit()
             return cursor.rowcount > 0
