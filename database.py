@@ -105,6 +105,9 @@ class Database:
                 await db.execute("ALTER TABLE groups ADD COLUMN group_title TEXT")
             if "is_enabled" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
+            if "last_message_id" not in group_columns:
+                # Intentionally not a foreign key: deleting a post must not rewind rotation.
+                await db.execute("ALTER TABLE groups ADD COLUMN last_message_id INTEGER")
             if "last_attempt_at" not in group_columns:
                 await db.execute("ALTER TABLE groups ADD COLUMN last_attempt_at REAL")
             if "next_attempt_at" not in group_columns:
@@ -517,6 +520,28 @@ class Database:
             return count
     
     # ===== GROUP OPERATIONS =====
+
+    async def get_next_group_message(self, campaign_id: int, group_id: int):
+        """Choose the next surviving post after this group's last delivered post."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("""
+                SELECT m.* FROM messages m JOIN groups g ON g.campaign_id=m.campaign_id
+                WHERE g.id=? AND g.campaign_id=? AND g.is_enabled=1
+                ORDER BY CASE WHEN g.last_message_id IS NULL OR m.id>g.last_message_id THEN 0 ELSE 1 END, m.id
+                LIMIT 1
+            """, (group_id, campaign_id))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def record_group_message(self, campaign_id: int, group_id: int, message_id: int):
+        """Advance only this group's rotation after Telegram confirms delivery."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE groups SET last_message_id=? WHERE id=? AND campaign_id=?",
+                (message_id, group_id, campaign_id),
+            )
+            await conn.commit()
 
     async def reserve_group_attempt(self, campaign_id: int, group_id: int, now: float) -> bool:
         """Reserve a due attempt before network I/O to avoid immediate retries after a crash."""

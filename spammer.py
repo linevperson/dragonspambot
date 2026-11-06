@@ -37,7 +37,6 @@ def normalize_group_destination(group_link):
 
 async def run_campaign_spam(campaign_id: int, admin_bot=None):
     """Send to each group when its independently persisted interval is due."""
-    message_index = 0
     while True:
         campaign = await db.get_campaign(campaign_id)
         if not campaign or not campaign["is_running"]:
@@ -58,7 +57,6 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
 
         random.shuffle(due_groups)
         for group in due_groups:
-            message = messages[message_index % len(messages)]
             group_link = group["group_link"]
             destination = normalize_group_destination(group_link)
             reserved = False
@@ -79,15 +77,14 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
                         await db.set_campaign_running(campaign_id, False, reason="account")
                         return
 
-                    # A post may have been edited/deleted while this task waited.
-                    message = await db.get_message(message["id"])
-                    if not message or message["campaign_id"] != campaign_id:
+                    # Read fresh content and the group's persisted rotation under the account lock.
+                    message = await db.get_next_group_message(campaign_id, group["id"])
+                    if not message:
                         continue
 
                     reserved = await db.reserve_group_attempt(campaign_id, group["id"], time.time())
                     if not reserved:
                         continue
-                    message_index += 1
                     campaign_sending[campaign_id] = group["id"]
                     try:
                         if isinstance(destination, int) and destination < 0:
@@ -100,6 +97,7 @@ async def run_campaign_spam(campaign_id: int, admin_bot=None):
 
                         if not await send_campaign_message(client, message, destination, admin_bot, still_running):
                             continue
+                        await db.record_group_message(campaign_id, group["id"], message["id"])
                         logger.info("✅ [Campaign %s] Sent msg#%s → %s", campaign_id, message["id"], destination)
                     except FloodWait as exc:
                         try:
